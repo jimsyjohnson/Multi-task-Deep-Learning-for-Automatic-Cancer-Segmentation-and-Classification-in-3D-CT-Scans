@@ -1,0 +1,792 @@
+# 1. Mount Google Drive
+      from google.colab import drive
+      drive.mount('/content/drive')
+
+# 2. Install nnunet-v2 and nibabel
+# Use --upgrade to ensure the latest version is installed
+# Use -q for quiet installation
+      !pip install --upgrade -q nnunetv2 nibabel
+
+import os
+
+# Define the base path to your Google Drive project
+      base_path = "/content/drive/MyDrive/my_colab_project"
+
+# Set the nnU-Net environment variables
+    os.environ['nnUNet_raw'] = os.path.join(base_path, 'nnUNet_raw')
+    os.environ['nnUNet_preprocessed'] = os.path.join(base_path, 'nnUNet_preprocessed')
+    os.environ['nnUNet_results'] = os.path.join(base_path, 'nnUNet_results')
+
+# Verify that the environment variables are set
+    print(f"nnUNet_raw: {os.environ.get('nnUNet_raw')}")
+    print(f"nnUNet_preprocessed: {os.environ.get('nnUNet_preprocessed')}")
+    print(f"nnUNet_results: {os.environ.get('nnUNet_results')}")
+
+# Optionally, create the directories if they don't exist
+    for path in [os.environ['nnUNet_raw'], os.environ['nnUNet_preprocessed'], os.environ['nnUNet_results']]:
+        os.makedirs(path, exist_ok=True)
+        print(f"Ensured directory exists: {path}")
+
+# ======= SAFE & ROBUST Step 4: copy/organize dataset into nnUNet_raw =======
+import os
+import shutil
+from pathlib import Path
+import json
+import nibabel as nib
+import numpy as np
+
+# --- CONFIGURE these to match your Google Drive project root ---
+BASE = "/content/drive/MyDrive/my_colab_project"   # your project folder
+# Reverting to original assumption that train/test are subfolders of BASE
+SRC_TRAIN = os.path.join(BASE, "train")           # existing train folder (contains subtype* subfolders or direct nii files)
+SRC_TEST  = os.path.join(BASE, "test")            # existing test folder (contains test nii files)
+# (if you use a 'validation' folder similarly, you can adapt later)
+
+# --- nnU-Net target structure (we use Dataset001_PancreasCancer as required) ---
+NNUNET_RAW = os.path.join(BASE, "nnUNet_raw")
+DATASET_NAME = "Dataset001_PancreasCancer"   # <- required naming
+DST_TASK = os.path.join(NNUNET_RAW, DATASET_NAME)
+DST_imagesTr = os.path.join(DST_TASK, "imagesTr")
+DST_labelsTr = os.path.join(DST_TASK, "labelsTr")
+DST_imagesTs = os.path.join(DST_TASK, "imagesTs")
+
+# --- safety flags ---
+VERIFY_LABEL_CONTENTS = False   # set True if you want to scan every label file for presence of label 0 (slower)
+
+# -------------------------------------------------------------------------
+# 1) quick sanity checks: ensure source folders exist and show counts
+# -------------------------------------------------------------------------
+print("SOURCE folders (you should check these):")
+print("  train:", SRC_TRAIN, "exists?", os.path.exists(SRC_TRAIN))
+print("  test :", SRC_TEST,  "exists?", os.path.exists(SRC_TEST))
+print()
+
+# list subfolders inside train (if any)
+train_subfolders = []
+if os.path.exists(SRC_TRAIN):
+    train_subfolders = [d for d in sorted(os.listdir(SRC_TRAIN)) if os.path.isdir(os.path.join(SRC_TRAIN, d)) and not d.startswith('._')] # Exclude hidden folders
+    print("Detected subfolders in train:", train_subfolders)
+else:
+    print("ERROR: train folder not found - please check SRC_TRAIN path and stop the cell.")
+    #raise SystemExit("Missing train source folder.") # Removed to allow inspection even if folder is missing
+
+# list subfolders inside test (if any) - for sanity check
+test_subfolders_check = []
+if os.path.exists(SRC_TEST):
+     test_subfolders_check = [d for d in sorted(os.listdir(SRC_TEST)) if os.path.isdir(os.path.join(SRC_TEST, d)) and not d.startswith('._')] # Exclude hidden folders
+     print("Detected subfolders in test:", test_subfolders_check)
+else:
+    print("WARNING: test folder not found. Proceeding without test (you can add later).")
+
+print("\nIf the above source paths are incorrect, STOP now and update SRC_TRAIN/SRC_TEST.")
+print("----------------------------------------------------------------------\n")
+
+# -------------------------------------------------------------------------
+# 2) Create destination folders (safe: exist_ok=True)
+# -------------------------------------------------------------------------
+os.makedirs(DST_imagesTr, exist_ok=True)
+os.makedirs(DST_labelsTr, exist_ok=True)
+os.makedirs(DST_imagesTs, exist_ok=True)
+print("Created/verified destination folders:")
+print(" ", DST_imagesTr)
+print(" ", DST_labelsTr)
+print(" ", DST_imagesTs)
+print()
+
+# -------------------------------------------------------------------------
+# 3) Copy files from train subfolders to imagesTr and labelsTr based on naming
+# -------------------------------------------------------------------------
+copied_images_tr_count = 0
+copied_labels_tr_count = 0
+
+# Clear destination folders before copying
+if os.path.exists(DST_imagesTr): shutil.rmtree(DST_imagesTr)
+if os.path.exists(DST_labelsTr): shutil.rmtree(DST_labelsTr)
+os.makedirs(DST_imagesTr)
+os.makedirs(DST_labelsTr)
+
+
+# Collect all .nii.gz files from source train subfolders, INCLUDING those starting with '.'
+all_train_files = []
+if os.path.isdir(SRC_TRAIN):
+    for root, _, files in os.walk(SRC_TRAIN):
+        for f in sorted(files):
+            if f.endswith('.nii.gz'):
+                all_train_files.append(os.path.join(root, f))
+else:
+    print(f"Warning: Source train directory {SRC_TRAIN} does not exist. No training files will be processed.")
+
+print(f"Found {len(all_train_files)} .nii.gz files inside train (including subfolders).")
+
+# DEBUG PRINT: Show all files found by os.walk
+print("DEBUG: Files found by os.walk in source train folders (first 20):")
+for i, f in enumerate(all_train_files[:20]):
+    print(f"  {f}")
+if len(all_train_files) > 20:
+    print("  ...")
+
+
+# Copy images (ending in _0000.nii.gz, potentially with leading '.') to imagesTr, removing leading '.'
+image_files_in_source = [f for f in all_train_files if Path(f).name.endswith('_0000.nii.gz')]
+print(f"Found {len(image_files_in_source)} image files ending in _0000.nii.gz in source train folders (including those starting with '.').")
+
+# DEBUG PRINT: Show image files identified after filtering
+print("DEBUG: Image files identified after filtering (first 20):")
+for i, f in enumerate(image_files_in_source[:20]):
+    print(f"  {f}")
+if len(image_files_in_source) > 20:
+    print("  ...")
+
+
+for src_full in image_files_in_source:
+    fname = os.path.basename(src_full)
+    # Remove leading '.' if it exists
+    dst_fname = fname[1:] if fname.startswith('.') else fname
+    dst_img = os.path.join(DST_imagesTr, dst_fname)
+    try:
+        shutil.copy2(src_full, dst_img)
+        copied_images_tr_count += 1
+    except Exception as e:
+        print(f"Failed to copy image {fname} to imagesTr: {e}")
+
+# Copy labels (ending in .nii.gz but NOT _0000.nii.gz, potentially with leading '.') to labelsTr, removing leading '.' and fix values
+# Corrected filtering: look for files ending in .nii.gz AND NOT ending in _0000.nii.gz (implicitly includes those starting with '.')
+# Refined filtering to explicitly include files starting with '.' if they are not images
+label_files_in_source = [f for f in all_train_files if Path(f).name.endswith('.nii.gz') and '_0000.nii.gz' not in Path(f).name]
+print(f"Found {len(label_files_in_source)} label files (not ending in _0000.nii.gz and including those starting with '.') in source train folders.")
+
+# DEBUG PRINT: Show label files found after filtering
+print("DEBUG: Label files identified after filtering (first 20):")
+for i, f in enumerate(label_files_in_source[:20]):
+    print(f"  {f}")
+if len(label_files_in_source) > 20:
+    print("  ...")
+
+# Need a function to fix label values - copying from a previous cell
+def fix_label_values(label_path):
+    img = nib.load(label_path)
+    data = img.get_fdata()
+    # Round to nearest integer and clip
+    data = np.rint(data).astype(np.int16)
+    data = np.clip(data, 0, 2)
+    # Ensure the header is preserved, especially affine and original data type might be good practice
+    # Create new Nifti1Image with fixed data, original affine and header
+    fixed_img = nib.Nifti1Image(data, img.affine, img.header)
+    nib.save(fixed_img, label_path)
+
+
+for src_full in label_files_in_source:
+    fname = os.path.basename(src_full)
+    # Remove leading '.' if it exists
+    dst_fname = fname[1:] if fname.startswith('.') else fname
+    dst_label = os.path.join(DST_labelsTr, dst_fname) # Copy label with its original name
+    # print(f"DEBUG: Attempting to copy label {src_full} to {dst_label}") # DEBUG PRINT for label copy
+    try:
+        shutil.copy2(src_full, dst_label)
+        # Only fix label values if the copy was successful and the file is not a hidden file (check original fname)
+        if not os.path.basename(src_full).startswith('.'): # Ensure we only fix actual label files, not hidden ones
+             fix_label_values(dst_label) # Fix label values after copying
+        copied_labels_tr_count += 1
+        # print(f"DEBUG: Successfully copied label {fname}") # DEBUG PRINT for successful label copy
+    except Exception as e:
+       print(f"❌ Failed to copy label {fname} from {src_full} to {dst_label}: {e}")
+
+
+print(f"✅ Copied {copied_images_tr_count} image files to imagesTr")
+# Check if label files were successfully copied before reporting the count
+actual_labels_copied = len([f for f in os.listdir(DST_labelsTr) if f.endswith('.nii.gz') and not f.startswith('.')])
+print(f"✅ Copied {actual_labels_copied} label files to labelsTr and fixed values.")
+print()
+
+# -------------------------------------------------------------------------
+# 4) Copy test images
+# -------------------------------------------------------------------------
+copied_test_count = 0
+files_to_process_test = []
+
+if os.path.isdir(SRC_TEST):
+    # CORRECTED: Walk through test subfolders to find images, excluding hidden files and folders
+    print(f"Checking test subfolders within: {SRC_TEST}")
+    # Explicitly list items and filter out hidden ones before checking if they are directories
+    test_items = [os.path.join(SRC_TEST, d) for d in sorted(os.listdir(SRC_TEST)) if not d.startswith('._')]
+    test_subfolders = [d for d in test_items if os.path.isdir(d)]
+    print(f"Detected valid subfolders in test: {test_subfolders}")
+
+    if test_subfolders:
+        for subtype_path in test_subfolders: # Iterate through valid subfolder paths
+            for root, _, files in os.walk(subtype_path):
+                for f in sorted(files):
+                    # Exclude files starting with '._'
+                    if f.endswith('_0000.nii.gz') and not f.startswith('._'): # Assuming test images also have _0000 suffix
+                         files_to_process_test.append(os.path.join(root, f))
+    else:
+        # Fallback: If no valid subfolders detected, check the SRC_TEST root directly (excluding hidden)
+         print("No valid test subfolders detected. Checking test root directory (excluding hidden files).")
+         files_to_process_test = [os.path.join(SRC_TEST, f) for f in sorted(os.listdir(SRC_TEST)) if f.endswith('_0000.nii.gz') and not f.startswith('._')]
+
+
+else:
+     print(f"Warning: Source test directory {SRC_TEST} does not exist. No test files will be processed.")
+
+
+print(f"Found {len(files_to_process_test)} .nii.gz files ending in _0000.nii.gz inside test (including subfolders), excluding hidden files.")
+
+# Clear destination test folder before copying
+if os.path.exists(DST_imagesTs): shutil.rmtree(DST_imagesTs)
+os.makedirs(DST_imagesTs)
+
+for src_full in files_to_process_test:
+    fname = os.path.basename(src_full)
+    # Remove leading '.' if it exists (shouldn't happen with filter, but as a safeguard)
+    dst_fname = fname[1:] if fname.startswith('.') else fname
+    dst = os.path.join(DST_imagesTs, dst_fname)
+    try:
+        shutil.copy2(src_full, dst)
+        copied_test_count += 1
+    except Exception as e:
+        print(f"Failed to copy test file {f}: {e}")
+
+print(f"✅ Copied {copied_test_count} test images.")
+print()
+
+# -------------------------------------------------------------------------
+# 5) Build training list (image<->label pairs) and warn about mismatches
+#    Correcting the logic for matching images and labels.
+# -------------------------------------------------------------------------
+# Re-read files from disk to ensure dataset.json reflects actual copied files
+train_images_final = sorted([f for f in os.listdir(DST_imagesTr) if f.endswith('_0000.nii.gz')])
+train_labels_final = sorted([f for f in os.listdir(DST_labelsTr) if f.endswith('.nii.gz') and '_0000.nii.gz' not in f]) # Ensure only label files
+
+
+# Build training pairs based on actual files and nnUNet naming convention
+training_pairs = []
+missing_labels = []
+for img_file in train_images_final:
+    base_name = img_file.replace('_0000.nii.gz', '')
+    expected_label_file = base_name + '.nii.gz'
+    if expected_label_file in train_labels_final:
+        training_pairs.append({
+            "image": f"./imagesTr/{img_file}",
+            "label": f"./labelsTr/{expected_label_file}"
+        })
+    else:
+        missing_labels.append((img_file, expected_label_file))
+
+
+print(f"Total images found in imagesTr: {len(train_images_final)}")
+print(f"Total labels found in labelsTr (excluding _0000): {len(train_labels_final)}")
+print(f"Matched image-label pairs for dataset.json: {len(training_pairs)}")
+if missing_labels:
+    print(f"WARNING: {len(missing_labels)} images in imagesTr have no matching label file in labelsTr (sample):")
+    for img, lbl in missing_labels[:10]:
+        print("  image:", img, "expected label:", lbl)
+print()
+
+# -------------------------------------------------------------------------
+# 6) Create dataset.json
+# -------------------------------------------------------------------------
+test_images_final = sorted([f for f in os.listdir(DST_imagesTs) if f.endswith('_0000.nii.gz')]) # Re-read test files
+
+
+dataset_json = {
+    "name": "PancreasCancer",
+    "description": "Pancreas cancer subtypes segmentation dataset",
+    "tensorImageSize": "3D",
+    "reference": "",
+    "licence": "",
+    "release": "1.0",
+    "modality": {
+        "0": "CT"
+    },
+    "channel_names": {"0": "CT"},
+    "labels": {
+        "background": 0,
+        "pancreas":1,
+        "tumor":2
+    },
+     "numTraining": len(training_pairs),
+    "numTest": len(test_images_final),
+    "training": training_pairs,
+    "test": [f"./imagesTs/{f}" for f in test_images_final],
+    "file_ending": ".nii.gz" # Added file_ending as it's crucial
+}
+
+json_path = os.path.join(NNUNET_RAW, DATASET_NAME, "dataset.json")
+with open(json_path, "w") as f:
+    json.dump(dataset_json, f, indent=4)
+
+print("Wrote dataset.json with matched training pairs and test list to:", json_path)
+print()
+
+# -------------------------------------------------------------------------
+# 7) Create dataset_ids (preprocessed) train.txt and test.txt as nnUNet expects
+#    Place under: nnUNet_preprocessed/Dataset001_PancreasCancer/dataset_ids/
+# -------------------------------------------------------------------------
+# Assuming nnUNet_preprocessed directory exists or will be created by planning
+preproc_dataset_folder = os.path.join(os.environ.get('nnUNet_preprocessed', BASE), DATASET_NAME)
+dataset_ids_folder = os.path.join(preproc_dataset_folder, "dataset_ids")
+os.makedirs(dataset_ids_folder, exist_ok=True)
+
+# IDs = filenames without the trailing _0000.nii.gz and .nii.gz
+train_ids = sorted([im['image'].replace('./imagesTr/','').replace('_0000.nii.gz', '') for im in training_pairs])
+test_ids  = sorted([f.replace('_0000.nii.gz', '') for f in test_images_final]) # Extract IDs from test images
+
+with open(os.path.join(dataset_ids_folder, "train.txt"), "w") as f:
+    f.write("\n".join(train_ids) + ("\n" if train_ids else ""))
+with open(os.path.join(dataset_ids_folder, "test.txt"), "w") as f:
+    f.write("\n".join(test_ids) + ("\n" if test_ids else ""))
+
+print("Created dataset_ids files at:", dataset_ids_folder)
+print("  train IDs:", len(train_ids))
+print("  test IDs :", len(test_ids))
+print()
+
+
+# 8) (Optional) quick label integrity check - scan a few label files to ensure label '0' exists
+#    Enable VERIFY_LABEL_CONTENTS = True above if you want this.
+# -------------------------------------------------------------------------
+if VERIFY_LABEL_CONTENTS:
+    try:
+        # Import necessary libraries if not already imported
+        # import nibabel as nib
+        # import numpy as np
+        print("Verifying label contents for presence of background label 0 (this may take a while)...")
+        bad_files = []
+        # Iterate through the label files that were actually copied
+        for lbl in train_labels_final:
+            labpath = os.path.join(DST_labelsTr, lbl)
+            try:
+                data = nib.load(labpath).get_fdata()
+                uniques = np.unique(data)
+                if 0 not in uniques:
+                    bad_files.append((lbl, uniques[:10]))
+            except Exception as e:
+                 print(f"Error reading label file {lbl} during verification: {e}")
+
+        if bad_files:
+            print("WARNING: some label files do NOT contain value 0 (background). Sample:")
+            for bf in bad_files[:10]:
+                print(" ", bf)
+        else:
+            print("All scanned labels contain background 0 (ok).")
+    except Exception as e:
+        print("Label verification failed (nibabel issue?):", e)
+
+# -------------------------------------------------------------------------
+# Summary: print final counts & sample lines from dataset.json
+# -------------------------------------------------------------------------
+print("FINAL SUMMARY:")
+print(" Dataset folder: ", DST_TASK)
+print(" imagesTr:", len([f for f in os.listdir(DST_imagesTr) if f.endswith('_0000.nii.gz')]))
+print(" labelsTr:", len([f for f in os.listdir(DST_labelsTr) if f.endswith('.nii.gz') and '_0000.nii.gz' not in f]))
+print(" imagesTs:", len([f for f in os.listdir(DST_imagesTs) if f.endswith('_0000.nii.gz')]))
+print(" dataset.json exists?", os.path.isfile(json_path))
+print()
+print("dataset.json sample entries (first 8 training):")
+# Load dataset.json to print sample entries
+try:
+    with open(json_path, 'r') as f:
+        dataset_json_loaded = json.load(f)
+        for entry in dataset_json_loaded.get("training", [])[:8]:
+            print(entry)
+except FileNotFoundError:
+print("### nnU-Net Planning and Preprocessing")
+print("\nBefore training, nnU-Net performs crucial planning and preprocessing steps to adapt to your specific dataset:")
+print("\n1.  **Dataset Fingerprinting**: nnU-Net analyzes the raw dataset to extract characteristics like image sizes, voxel spacings, intensity ranges, and the presence of different labels. This information is saved in a `dataset_fingerprint.json` file.")
+print("\n2.  **Experiment Planning**: Based on the fingerprint and hardware constraints (like GPU memory), nnU-Net automatically determines optimal parameters for training, including:")
+print("    -   **Target Spacing**: The resolution to which all images are resampled (e.g., median spacing of the dataset or a custom spacing).")
+print("    -   **Patch Size**: The size of the 3D patches used for training, optimized to fit within the GPU memory while being large enough to contain the relevant anatomical structures.")
+print("    -   **Normalization Schemes**: The method used to normalize image intensities (e.g., Z-score normalization, CT-specific normalization).")
+print("    -   **Network Architecture**: Based on the input patch size and target spacing, nnU-Net selects or designs a suitable U-Net architecture (e.g., number of downsampling layers, number of feature maps).")
+print("    -   **Data Augmentation**: Parameters for on-the-fly data augmentation during training.")
+print("    These planned parameters are saved in a `nnUNetPlans.json` file.")
+print("\n3.  **Preprocessing**: The raw data is then processed according to the `nnUNetPlans.json`. This typically involves:")
+print("    -   **Resampling**: Images and labels are resampled to the target spacing.")
+print("    -   **Normalization**: Image intensities are normalized.")
+print("    -   **Cropping/Padding**: Images might be cropped or padded to a consistent size or shape based on the median image size or patch size.")
+print("    The preprocessed data is saved to the `nnUNet_preprocessed` directory.")
+print("\nThese automated steps make nnU-Net highly adaptive to diverse medical image datasets and tasks, reducing the need for manual hyperparameter tuning related to data handling.")
+
+
+print("\n--- Running nnUNetv2_plan_and_preprocess ---")
+
+import shutil
+import os
+
+# Check if the command is available in the environment's PATH
+nnunet_plan_cmd = shutil.which('nnUNetv2_plan_and_preprocess')
+
+if nnunet_plan_cmd:
+    print(f"nnUNetv2_plan_and_preprocess command found at: {nnunet_plan_cmd}. Attempting to run planning and preprocessing.")
+    # Construct and execute the command using the found path
+    # Specify dataset ID 1 (-d 1), configuration 3d_fullres (-c 3d_fullres),
+    # and specify 2 data loading processes (-np 2)
+    command = f"{nnunet_plan_cmd} -d 1 -c 3d_fullres -np 2"
+    print(f"Executing command: {command}")
+    !{command}
+else:
+    print("nnUNetv2_plan_and_preprocess command not found. Cannot proceed with planning and preprocessing.")
+
+    print("dataset.json not found.")
+except Exception as e:
+    print(f"Error reading dataset.json: {e}")
+
+print("\n🎉 Data preparation completed with corrected file matching logic.")
+
+# Re-run data preparation with explicit exclusion of hidden files starting with '.'
+# ======= SAFE & ROBUST Step 4: copy/organize dataset into nnUNet_raw =======
+import os
+import shutil
+from pathlib import Path
+import json
+import nibabel as nib
+import numpy as np
+
+# --- CONFIGURE these to match your Google Drive project root ---
+BASE = "/content/drive/MyDrive/my_colab_project"   # your project folder
+# Reverting to original assumption that train/test are subfolders of BASE
+SRC_TRAIN = os.path.join(BASE, "train")           # existing train folder (contains subtype* subfolders or direct nii files)
+SRC_TEST  = os.path.join(BASE, "test")            # existing test folder (contains test nii files)
+# (if you use a 'validation' folder similarly, you can adapt later)
+
+# --- nnU-Net target structure (we use Dataset001_PancreasCancer as required) ---
+NNUNET_RAW = os.path.join(BASE, "nnUNet_raw")
+DATASET_NAME = "Dataset001_PancreasCancer"   # <- required naming
+DST_TASK = os.path.join(NNUNET_RAW, DATASET_NAME)
+DST_imagesTr = os.path.join(DST_TASK, "imagesTr")
+DST_labelsTr = os.path.join(DST_TASK, "labelsTr")
+DST_imagesTs = os.path.join(DST_TASK, "imagesTs")
+
+# --- safety flags ---
+VERIFY_LABEL_CONTENTS = False   # set True if you want to scan every label file for presence of label 0 (slower)
+
+# -------------------------------------------------------------------------
+# 1) quick sanity checks: ensure source folders exist and show counts
+# -------------------------------------------------------------------------
+print("SOURCE folders (you should check these):")
+print("  train:", SRC_TRAIN, "exists?", os.path.exists(SRC_TRAIN))
+print("  test :", SRC_TEST,  "exists?", os.path.exists(SRC_TEST))
+print()
+
+# list subfolders inside train (if any)
+train_subfolders = []
+if os.path.exists(SRC_TRAIN):
+    train_subfolders = [d for d in sorted(os.listdir(SRC_TRAIN)) if os.path.isdir(os.path.join(SRC_TRAIN, d)) and not d.startswith('._')] # Exclude hidden folders
+    print("Detected subfolders in train:", train_subfolders)
+else:
+    print("ERROR: train folder not found - please check SRC_TRAIN path and stop the cell.")
+    #raise SystemExit("Missing train source folder.") # Removed to allow inspection even if folder is missing
+
+# list subfolders inside test (if any) - for sanity check
+test_subfolders_check = []
+if os.path.exists(SRC_TEST):
+     test_subfolders_check = [d for d in sorted(os.listdir(SRC_TEST)) if os.path.isdir(os.path.join(SRC_TEST, d)) and not d.startswith('._')] # Exclude hidden folders
+     print("Detected subfolders in test:", test_subfolders_check)
+else:
+    print("WARNING: test folder not found. Proceeding without test (you can add later).")
+
+print("\nIf the above source paths are incorrect, STOP now and update SRC_TRAIN/SRC_TEST.")
+print("----------------------------------------------------------------------\n")
+
+# -------------------------------------------------------------------------
+# 2) Create destination folders (safe: exist_ok=True)
+# -------------------------------------------------------------------------
+os.makedirs(DST_imagesTr, exist_ok=True)
+os.makedirs(DST_labelsTr, exist_ok=True)
+os.makedirs(DST_imagesTs, exist_ok=True)
+print("Created/verified destination folders:")
+print(" ", DST_imagesTr)
+print(" ", DST_labelsTr)
+print(" ", DST_imagesTs)
+print()
+
+# -------------------------------------------------------------------------
+# 3) Copy files from train subfolders to imagesTr and labelsTr based on naming, EXCLUDING hidden files
+# -------------------------------------------------------------------------
+copied_images_tr_count = 0
+copied_labels_tr_count = 0
+
+# Clear destination folders before copying
+if os.path.exists(DST_imagesTr): shutil.rmtree(DST_imagesTr)
+if os.path.exists(DST_labelsTr): shutil.rmtree(DST_labelsTr)
+os.makedirs(DST_imagesTr)
+os.makedirs(DST_labelsTr)
+
+
+# Collect all .nii.gz files from source train subfolders, EXCLUDING those starting with '.'
+all_train_files = []
+if os.path.isdir(SRC_TRAIN):
+    for root, _, files in os.walk(SRC_TRAIN):
+        for f in sorted(files):
+            # Explicitly exclude files starting with '.'
+            if f.endswith('.nii.gz') and not f.startswith('.'):
+                all_train_files.append(os.path.join(root, f))
+else:
+    print(f"Warning: Source train directory {SRC_TRAIN} does not exist. No training files will be processed.")
+
+print(f"Found {len(all_train_files)} .nii.gz files inside train (including subfolders), EXCLUDING hidden files.")
+
+# Copy images (ending in _0000.nii.gz) to imagesTr
+image_files_in_source = [f for f in all_train_files if Path(f).name.endswith('_0000.nii.gz')]
+print(f"Found {len(image_files_in_source)} image files ending in _0000.nii.gz in source train folders.")
+
+for src_full in image_files_in_source:
+    fname = os.path.basename(src_full)
+    dst_img = os.path.join(DST_imagesTr, fname)
+    try:
+        shutil.copy2(src_full, dst_img)
+        copied_images_tr_count += 1
+    except Exception as e:
+        print(f"Failed to copy image {fname} to imagesTr: {e}")
+
+# Copy labels (ending in .nii.gz but NOT _0000.nii.gz) to labelsTr and fix values
+label_files_in_source = [f for f in all_train_files if Path(f).name.endswith('.nii.gz') and '_0000.nii.gz' not in Path(f).name]
+print(f"Found {len(label_files_in_source)} label files (not ending in _0000.nii.gz) in source train folders.")
+
+# Need a function to fix label values - copying from a previous cell
+def fix_label_values(label_path):
+    img = nib.load(label_path)
+    data = img.get_fdata()
+    # Round to nearest integer and clip
+    data = np.rint(data).astype(np.int16)
+    data = np.clip(data, 0, 2)
+    # Ensure the header is preserved, especially affine and original data type might be good practice
+    # Create new Nifti1Image with fixed data, original affine and header
+    fixed_img = nib.Nifti1Image(data, img.affine, img.header)
+    nib.save(fixed_img, label_path)
+
+
+for src_full in label_files_in_source:
+    fname = os.path.basename(src_full)
+    dst_label = os.path.join(DST_labelsTr, fname) # Copy label with its original name
+    try:
+        shutil.copy2(src_full, dst_label)
+        fix_label_values(dst_label) # Fix label values after copying
+        copied_labels_tr_count += 1
+    except Exception as e:
+       print(f"Failed to copy label {fname} to labelsTr: {e}")
+
+
+print(f"✅ Copied {copied_images_tr_count} image files to imagesTr")
+print(f"✅ Copied {copied_labels_tr_count} label files to labelsTr and fixed values.")
+print()
+
+# -------------------------------------------------------------------------
+# 4) Copy test images, EXCLUDING hidden files
+# -------------------------------------------------------------------------
+copied_test_count = 0
+files_to_process_test = []
+
+if os.path.isdir(SRC_TEST):
+    # CORRECTED: Walk through test subfolders or root to find images, excluding hidden files
+    for root, _, files in os.walk(SRC_TEST):
+        for f in sorted(files):
+            # Exclude files starting with '._'
+            if f.endswith('_0000.nii.gz') and not f.startswith('._'): # Assuming test images also have _0000 suffix
+                 files_to_process_test.append(os.path.join(root, f))
+
+else:
+     print(f"Warning: Source test directory {SRC_TEST} does not exist. No test files will be processed.")
+
+
+print(f"Found {len(files_to_process_test)} .nii.gz files ending in _0000.nii.gz inside test (including subfolders), excluding hidden files.")
+
+# Clear destination test folder before copying
+if os.path.exists(DST_imagesTs): shutil.rmtree(DST_imagesTs)
+os.makedirs(DST_imagesTs)
+
+for src_full in files_to_process_test:
+    fname = os.path.basename(src_full)
+    dst = os.path.join(DST_imagesTs, fname)
+    try:
+        shutil.copy2(src_full, dst)
+        copied_test_count += 1
+    except Exception as e:
+        print(f"Failed to copy test file {f}: {e}")
+
+print(f"✅ Copied {copied_test_count} test images.")
+print()
+
+# -------------------------------------------------------------------------
+# 5) Build training list (image<->label pairs) and warn about mismatches
+#    Correcting the logic for matching images and labels.
+# -------------------------------------------------------------------------
+# Re-read files from disk to ensure dataset.json reflects actual copied files
+train_images_final = sorted([f for f in os.listdir(DST_imagesTr) if f.endswith('_0000.nii.gz')])
+train_labels_final = sorted([f for f in os.listdir(DST_labelsTr) if f.endswith('.nii.gz') and '_0000.nii.gz' not in f]) # Ensure only label files
+
+
+# Build training pairs based on actual files and nnUNet naming convention
+training_pairs = []
+missing_labels = []
+for img_file in train_images_final:
+    base_name = img_file.replace('_0000.nii.gz', '')
+    expected_label_file = base_name + '.nii.gz'
+    if expected_label_file in train_labels_final:
+        training_pairs.append({
+            "image": f"./imagesTr/{img_file}",
+            "label": f"./labelsTr/{expected_label_file}"
+        })
+    else:
+        missing_labels.append((img_file, expected_label_file))
+
+
+print(f"Total images found in imagesTr: {len(train_images_final)}")
+print(f"Total labels found in labelsTr (excluding _0000): {len(train_labels_final)}")
+print(f"Matched image-label pairs for dataset.json: {len(training_pairs)}")
+if missing_labels:
+    print(f"WARNING: {len(missing_labels)} images in imagesTr have no matching label file in labelsTr (sample):")
+    for img, lbl in missing_labels[:10]:
+        print("  image:", img, "expected label:", lbl)
+print()
+
+# -------------------------------------------------------------------------
+# 6) Create dataset.json
+# -------------------------------------------------------------------------
+test_images_final = sorted([f for f in os.listdir(DST_imagesTs) if f.endswith('_0000.nii.gz')]) # Re-read test files
+
+
+dataset_json = {
+    "name": "PancreasCancer",
+    "description": "Pancreas cancer subtypes segmentation dataset",
+    "tensorImageSize": "3D",
+    "reference": "",
+    "licence": "",
+    "release": "1.0",
+    "modality": {
+        "0": "CT"
+    },
+    "channel_names": {"0": "CT"},
+    "labels": {
+        "background": 0,
+        "pancreas":1,
+        "tumor":2
+    },
+     "numTraining": len(training_pairs),
+    "numTest": len(test_images_final),
+    "training": training_pairs,
+    "test": [f"./imagesTs/{f}" for f in test_images_final],
+    "file_ending": ".nii.gz" # Added file_ending as it's crucial
+}
+
+json_path = os.path.join(NNUNET_RAW, DATASET_NAME, "dataset.json")
+with open(json_path, "w") as f:
+    json.dump(dataset_json, f, indent=4)
+
+print("Wrote dataset.json with matched training pairs and test list to:", json_path)
+print()
+
+# -------------------------------------------------------------------------
+# 7) Create dataset_ids (preprocessed) train.txt and test.txt as nnUNet expects
+#    Place under: nnUNet_preprocessed/Dataset001_PancreasCancer/dataset_ids/
+# -------------------------------------------------------------------------
+# Assuming nnUNet_preprocessed directory exists or will be created by planning
+preproc_dataset_folder = os.path.join(os.environ.get('nnUNet_preprocessed', BASE), DATASET_NAME)
+dataset_ids_folder = os.path.join(preproc_dataset_folder, "dataset_ids")
+os.makedirs(dataset_ids_folder, exist_ok=True)
+
+# IDs = filenames without the trailing _0000.nii.gz and .nii.gz
+train_ids = sorted([im['image'].replace('./imagesTr/','').replace('_0000.nii.gz', '') for im in training_pairs])
+test_ids  = sorted([f.replace('_0000.nii.gz', '') for f in test_images_final]) # Extract IDs from test images
+
+with open(os.path.join(dataset_ids_folder, "train.txt"), "w") as f:
+    f.write("\n".join(train_ids) + ("\n" if train_ids else ""))
+with open(os.path.join(dataset_ids_folder, "test.txt"), "w") as f:
+    f.write("\n".join(test_ids) + ("\n" if test_ids else ""))
+
+print("Created dataset_ids files at:", dataset_ids_folder)
+print("  train IDs:", len(train_ids))
+print("  test IDs :", len(test_ids))
+print()
+
+
+# 8) (Optional) quick label integrity check - scan a few label files to ensure label '0' exists
+#    Enable VERIFY_LABEL_CONTENTS = True above if you want this.
+# -------------------------------------------------------------------------
+if VERIFY_LABEL_CONTENTS:
+    try:
+        # Import necessary libraries if not already imported
+        # import nibabel as nib
+        # import numpy as np
+        print("Verifying label contents for presence of background label 0 (this may take a while)...")
+        bad_files = []
+        # Iterate through the label files that were actually copied
+        for lbl in train_labels_final:
+            labpath = os.path.join(DST_labelsTr, lbl)
+            try:
+                data = nib.load(labpath).get_fdata()
+                uniques = np.unique(data)
+                if 0 not in uniques:
+                    bad_files.append((lbl, uniques[:10]))
+            except Exception as e:
+                 print(f"Error reading label file {lbl} during verification: {e}")
+
+        if bad_files:
+            print("WARNING: some label files do NOT contain value 0 (background). Sample:")
+            for bf in bad_files[:10]:
+                print(" ", bf)
+        else:
+            print("All scanned labels contain background 0 (ok).")
+    except Exception as e:
+        print("Label verification failed (nibabel issue?):", e)
+
+# -------------------------------------------------------------------------
+# Summary: print final counts & sample lines from dataset.json
+# -------------------------------------------------------------------------
+print("FINAL SUMMARY:")
+print(" Dataset folder: ", DST_TASK)
+print(" imagesTr:", len([f for f in os.listdir(DST_imagesTr) if f.endswith('_0000.nii.gz')]))
+print(" labelsTr:", len([f for f in os.listdir(DST_labelsTr) if f.endswith('.nii.gz') and '_0000.nii.gz' not in f]))
+print(" imagesTs:", len([f for f in os.listdir(DST_imagesTs) if f.endswith('_0000.nii.gz')]))
+print(" dataset.json exists?", os.path.isfile(json_path))
+print()
+print("dataset.json sample entries (first 8 training):")
+# Load dataset.json to print sample entries
+try:
+    with open(json_path, 'r') as f:
+        dataset_json_loaded = json.load(f)
+        for entry in dataset_json_loaded.get("training", [])[:8]:
+            print(entry)
+except FileNotFoundError:
+    print("dataset.json not found.")
+except Exception as e:
+    print(f"Error reading dataset.json: {e}")
+
+print("\n🎉 Data preparation completed with corrected file matching logic.")
+
+print("\n--- Running nnUNetv2_plan_and_preprocess after data prep correction ---")
+
+# Check if the command is available in the environment's PATH
+nnunet_plan_cmd = shutil.which('nnUNetv2_plan_and_preprocess')
+
+if nnunet_plan_cmd:
+    print(f"nnUNetv2_plan_and_preprocess command found at: {nnunet_plan_cmd}. Attempting to run planning and preprocessing.")
+    # Construct and execute the command using the found path
+    # Specify dataset ID 1 (-d 1), configuration 3d_fullres (-c 3d_fullres),
+    # and specify 2 data loading processes (-np 2)
+    command = f"{nnunet_plan_cmd} -d 1 -c 3d_fullres -np 2"
+    print(f"Executing command: {command}")
+    !{command}
+else:
+    print("nnUNetv2_plan_and_preprocess command not found. Cannot proceed with planning and preprocessing.")
+
+# Training
+ import shutil
+import os
+
+# Check if the command is available in the environment's PATH
+nnunet_train_cmd = shutil.which('nnUNetv2_train')
+
+if nnunet_train_cmd:
+    print(f"nnUNetv2_train command found at: {nnunet_train_cmd}. Attempting to resume training.")
+    # Construct the command to resume training
+    # Specify dataset ID 1, configuration 3d_fullres, and fold 0
+    command = f"{nnunet_train_cmd} 1 3d_fullres 0"
+
+    # Execute the command
+    print(f"Executing command: {command}")
+    !{command}
+else:
+    print("nnUNetv2_train command not found. Cannot proceed with resuming training.")
+    # If the command is not found, the subtask cannot be completed.
+    # We will indicate failure after this attempt.
