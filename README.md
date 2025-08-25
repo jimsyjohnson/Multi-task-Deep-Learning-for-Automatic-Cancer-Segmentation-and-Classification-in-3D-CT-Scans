@@ -1,4 +1,4 @@
-# Multi-task Deep Learning Model for Pancreas Cancer Segmentation and Classification using nnU-Net v2
+# Deep Learning Model for Pancreas Cancer Segmentation and Classification using nnU-Net v2
 
 ## Overview
 This project implements a **multi-task nnU-Net v2** pipeline for **pancreas and lesion segmentation** from 3D CT scans. The model leverages a **shared encoder** for feature extraction and **dual decoders** for segmentation and classification. The pipeline is trained on a dataset of 252 CT volumes and achieves a **best intermediate Dice score of 0.7643** for pancreas segmentation. 
